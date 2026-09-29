@@ -2,7 +2,7 @@ streamlit
 plotly
 pandas
 python-dotenv
-groq
+openai>=1.0
 google-genai
 Pillow
 mss
