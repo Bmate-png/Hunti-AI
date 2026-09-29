@@ -2,10 +2,16 @@ import json
 import os
 from typing import Any, Dict, List
 from dotenv import load_dotenv
-from groq import Groq
+from openai import OpenAI
 from database import get_connection
 
 load_dotenv()
+
+# --- OpenRouter config ---
+# If the exact model slug on OpenRouter differs, override it with the
+# OPENROUTER_MODEL env var / Streamlit secret (e.g. "qwen/qwen3.8-27b:free")
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "qwen/qwen3.8-27b")
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
 
 def _load_api_key(name: str) -> str:
@@ -18,10 +24,21 @@ def _load_api_key(name: str) -> str:
     return api_key
 
 
-def init_groq_client() -> Groq:
-    """Initialize the Groq client for text tasks."""
-    api_key = _load_api_key("GROQ_API_KEY")
-    return Groq(api_key=api_key)
+def init_openrouter_client() -> OpenAI:
+    """Initialize the OpenRouter client (OpenAI-compatible API)."""
+    api_key = _load_api_key("OPENROUTER_API_KEY")
+    return OpenAI(
+        api_key=api_key,
+        base_url=OPENROUTER_BASE_URL,
+        default_headers={
+            "HTTP-Referer": os.getenv("APP_URL", "https://hunti-ai.streamlit.app"),
+            "X-Title": "Hunti AI",
+        },
+    )
+
+
+# Backwards-compatible alias so dashboard.py keeps working unchanged
+init_groq_client = init_openrouter_client
 
 
 def load_business_profile() -> Dict[str, Any]:
@@ -48,7 +65,7 @@ def save_leads_to_db(leads: List[Dict[str, Any]]) -> int:
     """Save leads to the database and return the count."""
     conn = get_connection()
     cursor = conn.cursor()
-    
+
     saved_count = 0
     for lead in leads:
         cursor.execute('''
@@ -62,7 +79,7 @@ def save_leads_to_db(leads: List[Dict[str, Any]]) -> int:
             lead.get('rating', 0.0)
         ))
         saved_count += 1
-    
+
     conn.commit()
     conn.close()
     return saved_count
@@ -73,13 +90,13 @@ def get_all_leads_from_db() -> List[Dict[str, Any]]:
     # If the real database doesn't exist (e.g., on Streamlit Cloud), use demo data
     if not os.path.exists("hunti.db"):
         return load_demo_leads()
-        
+
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute('SELECT * FROM leads ORDER BY created_at DESC')
     rows = cursor.fetchall()
     conn.close()
-    
+
     return [dict(row) for row in rows]
 
 
@@ -87,7 +104,7 @@ def get_lead_count_from_db() -> int:
     """Get total number of leads."""
     if not os.path.exists("hunti.db"):
         return len(load_demo_leads())
-        
+
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute('SELECT COUNT(*) FROM leads')
@@ -114,24 +131,24 @@ def build_sales_prompt(lead: Dict[str, Any]) -> str:
     )
 
 
-def generate_pitch(client: Groq, lead: Dict[str, Any]) -> str:
-    """Generate a personalized pitch using GROQ and save to database."""
+def generate_pitch(client: OpenAI, lead: Dict[str, Any]) -> str:
+    """Generate a personalized pitch using OpenRouter (Qwen) and save to database."""
     prompt = build_sales_prompt(lead)
 
     try:
         response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model=OPENROUTER_MODEL,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.3,
             max_tokens=300,
         )
     except Exception as exc:
-        raise RuntimeError(f"Groq API request failed for {lead.get('company_name', 'unknown')}: {exc}") from exc
+        raise RuntimeError(f"OpenRouter API request failed for {lead.get('company_name', 'unknown')}: {exc}") from exc
 
     pitch_text = response.choices[0].message.content
     if not pitch_text:
-        raise RuntimeError(f"Groq response did not include text for lead {lead.get('company_name', 'unknown')}")
-    
+        raise RuntimeError(f"OpenRouter response did not include text for lead {lead.get('company_name', 'unknown')}")
+
     # Save pitch to database (only if database exists)
     lead_id = lead.get('id')
     if lead_id and os.path.exists("hunti.db"):
@@ -146,7 +163,7 @@ def generate_pitch(client: Groq, lead: Dict[str, Any]) -> str:
             conn.close()
         except Exception as e:
             print(f"Warning: Could not save pitch to database: {e}")
-    
+
     return pitch_text.strip()
 
 
@@ -163,13 +180,13 @@ def build_pitches(
     leads_file: str = "leads.json",
     output_file: str = "pitches.json",
 ) -> List[Dict[str, str]]:
-    """Read leads from database, generate pitches with Groq, and save."""
+    """Read leads from database, generate pitches with OpenRouter, and save."""
     leads = get_all_leads_from_db()
-    
+
     if not leads:
         raise ValueError("No leads found in database. Please scrape leads first.")
-    
-    client = init_groq_client()
+
+    client = init_openrouter_client()
     pitches: List[Dict[str, str]] = []
 
     for lead in leads:
@@ -188,7 +205,7 @@ def get_pitches_from_db() -> List[Dict[str, Any]]:
     """Get all pitches with their associated lead info."""
     if not os.path.exists("hunti.db"):
         return []
-        
+
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute('''
@@ -207,7 +224,7 @@ def log_email_sent(pitch_id: int, recipient_email: str, subject: str) -> None:
     if not os.path.exists("hunti.db"):
         print(f"Demo mode: Would send email to {recipient_email}")
         return
-        
+
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute('''
@@ -219,16 +236,16 @@ def log_email_sent(pitch_id: int, recipient_email: str, subject: str) -> None:
 
 
 def ask_assistant(user_task: str, chat_history: list = None, temperature: float = 0.2) -> Dict[str, Any]:
-    """Query GROQ text model to act as a consultative sales assistant with memory."""
-    client = init_groq_client()
+    """Query the OpenRouter (Qwen) model to act as a consultative sales assistant with memory."""
+    client = init_openrouter_client()
     profile = load_business_profile()
-    
+
     if profile:
         business_name = profile.get('business_name', 'Hunti AI Solutions')
         founder = profile.get('founder', profile.get('owner', 'Máté Baranyai'))
         services = profile.get('services', [])
         profile_text = json.dumps(profile, indent=2)
-        
+
         context = (
             f"You are the AI Sales Consultant for {business_name}, founded by {founder}. "
             f"Follow this NATURAL sales conversation flow:\n\n"
@@ -247,25 +264,25 @@ def ask_assistant(user_task: str, chat_history: list = None, temperature: float 
     else:
         context = "You are Hunti, a highly intelligent desktop AI assistant."
 
-    # Build messages for Groq, including history
+    # Build messages, including history
     messages = [{"role": "system", "content": context}]
-    
+
     if chat_history:
         for msg in chat_history:
             messages.append({"role": msg["role"], "content": msg["content"]})
-    
+
     # Add the latest user message
     messages.append({"role": "user", "content": user_task})
 
     try:
         response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile", 
+            model=OPENROUTER_MODEL,
             messages=messages,
             temperature=max(0.0, min(1.0, temperature)),
             max_tokens=600,
         )
     except Exception as exc:
-        raise RuntimeError(f"Groq assistant request failed: {exc}") from exc
+        raise RuntimeError(f"OpenRouter assistant request failed: {exc}") from exc
 
     response_text = response.choices[0].message.content
     return parse_text_response(response_text)
@@ -278,7 +295,7 @@ def parse_text_response(response_text: str) -> Dict[str, Any]:
         cleaned = cleaned.replace("```json", "").replace("```", "").strip()
     elif cleaned.startswith("```"):
         cleaned = cleaned.replace("```", "").strip()
-    
+
     try:
         parsed = json.loads(cleaned)
     except json.JSONDecodeError as exc:
